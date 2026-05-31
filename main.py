@@ -1,0 +1,326 @@
+"""
+ScalpBot OANDA — Backend Principal
+FastAPI + bucle del bot + WebSocket para el dashboard
+"""
+import asyncio
+import structlog
+from datetime import datetime
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import Optional
+import json
+import os
+
+from config import get_settings
+from oanda_client import OandaClient
+from signal_engine import SignalEngine
+from risk_manager import RiskManager
+import telegram_alerts as tg
+
+log    = structlog.get_logger()
+cfg    = get_settings()
+
+# ── ESTADO GLOBAL DEL BOT ────────────────────────────────────────
+class BotState:
+    status:        str   = "STOPPED"   # STOPPED | RUNNING | PAUSED | ERROR
+    mode:          str   = cfg.oanda_env.upper()
+    last_signal:   dict  = {}
+    last_price:    float = 0.0
+    last_error:    str   = ""
+    loop_task:     Optional[asyncio.Task] = None
+    ws_clients:    list  = []
+
+state  = BotState()
+oanda  = OandaClient()
+engine = SignalEngine()
+risk   = RiskManager()
+
+# ── WEBSOCKET BROADCAST ──────────────────────────────────────────
+async def broadcast(data: dict):
+    dead = []
+    for ws in state.ws_clients:
+        try:
+            await ws.send_json(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        state.ws_clients.remove(ws)
+
+# ── BUCLE PRINCIPAL DEL BOT ──────────────────────────────────────
+async def bot_loop():
+    log.info("bot.loop_started")
+    tg.alert_bot_start(cfg.oanda_env, cfg.oanda_instrument)
+    tick = 0
+
+    while state.status == "RUNNING":
+        try:
+            tick += 1
+
+            # ── Precio actual ──────────────────────────────────
+            price_data = oanda.get_price()
+            state.last_price = price_data["mid"]
+            spread = price_data["spread"]
+
+            # ── Broadcast precio a dashboard ───────────────────
+            await broadcast({
+                "type":   "price",
+                "price":  state.last_price,
+                "spread": spread,
+                "bid":    price_data["bid"],
+                "ask":    price_data["ask"],
+                "ts":     datetime.now().isoformat(),
+            })
+
+            # ── Analizar señal cada 10 ticks (≈10s) ───────────
+            if tick % 10 == 0:
+                candles_m1 = oanda.get_candles(60, "M1")
+                candles_m5 = oanda.get_candles(30, "M5")
+                signal = engine.analyze(candles_m1, candles_m5, state.last_price, spread)
+
+                # Broadcast indicadores
+                await broadcast({
+                    "type":      "signal",
+                    "direction": signal.direction,
+                    "rsi":       round(signal.rsi, 1),
+                    "atr":       round(signal.atr, 1),
+                    "reason":    signal.reason,
+                })
+
+                if signal.direction != "NONE":
+                    open_trades = oanda.get_open_trades()
+                    can_trade, reason = risk.can_open_trade(len(open_trades))
+
+                    if can_trade:
+                        units = risk.calc_position_size(signal.entry_price, signal.sl_price)
+                        if signal.direction == "SHORT":
+                            units = -units
+
+                        # ── ORDEN REAL EN OANDA ────────────────
+                        order = oanda.place_order(
+                            units=units,
+                            sl_price=signal.sl_price,
+                            tp_price=signal.tp_price,
+                            comment=signal.reason
+                        )
+
+                        tg.alert_signal(
+                            direction=signal.direction,
+                            price=signal.entry_price,
+                            sl=signal.sl_price,
+                            tp=signal.tp_price,
+                            units=abs(units),
+                            atr=signal.atr,
+                            reason=signal.reason,
+                        )
+
+                        await broadcast({
+                            "type":  "order",
+                            "order": order,
+                        })
+
+                        state.last_signal = order
+                    else:
+                        log.info("bot.trade_blocked", reason=reason)
+                        await broadcast({"type": "risk_block", "reason": reason})
+
+            # ── Resumen de riesgo cada 60 ticks ───────────────
+            if tick % 60 == 0:
+                risk_status = risk.get_status()
+                await broadcast({"type": "risk", **risk_status})
+
+                # Stop automático si pérdida máxima alcanzada
+                max_loss = risk_status["equity"] * (cfg.max_daily_loss_pct / 100)
+                if risk_status["daily_pnl"] <= -max_loss:
+                    log.warning("bot.daily_loss_limit")
+                    tg.alert_risk_stop("Pérdida diaria máxima", risk_status["daily_pnl"])
+                    state.status = "PAUSED"
+                    await broadcast({"type": "status", "status": "PAUSED",
+                                     "reason": "Pérdida diaria máxima alcanzada"})
+                    return
+
+        except Exception as e:
+            state.last_error = str(e)
+            log.error("bot.loop_error", error=str(e))
+            tg.alert_error(str(e))
+            await broadcast({"type": "error", "message": str(e)})
+            await asyncio.sleep(5)
+
+        await asyncio.sleep(1)  # tick cada 1 segundo
+
+    log.info("bot.loop_ended", status=state.status)
+
+# ── LIFESPAN ─────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    tg.init_telegram()
+    log.info("scalpbot.started", env=cfg.oanda_env, instrument=cfg.oanda_instrument)
+    yield
+    if state.loop_task:
+        state.loop_task.cancel()
+    tg.alert_bot_stop("Servidor reiniciado")
+    log.info("scalpbot.shutdown")
+
+# ── APP ──────────────────────────────────────────────────────────
+app = FastAPI(
+    title="ScalpBot OANDA",
+    version="2.0",
+    description="Bot de scalping DAX40 con OANDA API v20",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Servir el frontend (scalp-bot.html) en la raíz
+if os.path.exists("/usr/share/nginx/html"):
+    pass  # nginx sirve el frontend
+else:
+    try:
+        app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
+    except Exception:
+        pass
+
+# ── AUTH SIMPLE ───────────────────────────────────────────────────
+security = HTTPBearer(auto_error=False)
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials or credentials.credentials != cfg.dashboard_password:
+        raise HTTPException(status_code=401, detail="No autorizado")
+    return True
+
+# ── ENDPOINTS ────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "bot": state.status, "env": cfg.oanda_env}
+
+@app.get("/api/status")
+def get_status(_=Depends(verify_token)):
+    return {
+        "bot_status":   state.status,
+        "env":          cfg.oanda_env,
+        "instrument":   cfg.oanda_instrument,
+        "last_price":   state.last_price,
+        "last_signal":  state.last_signal,
+        "last_error":   state.last_error,
+        "risk":         risk.get_status(),
+    }
+
+@app.get("/api/account")
+def get_account(_=Depends(verify_token)):
+    return oanda.get_account()
+
+@app.get("/api/positions")
+def get_positions(_=Depends(verify_token)):
+    return {"positions": oanda.get_open_trades()}
+
+@app.get("/api/price")
+def get_price(_=Depends(verify_token)):
+    return oanda.get_price()
+
+@app.get("/api/candles")
+def get_candles(granularity: str = "M1", count: int = 60, _=Depends(verify_token)):
+    return {"candles": oanda.get_candles(count, granularity)}
+
+@app.post("/api/bot/start")
+async def start_bot(_=Depends(verify_token)):
+    if state.status == "RUNNING":
+        return {"ok": False, "message": "Bot ya está corriendo"}
+    state.status = "RUNNING"
+    state.loop_task = asyncio.create_task(bot_loop())
+    log.info("api.bot_started")
+    return {"ok": True, "status": "RUNNING"}
+
+@app.post("/api/bot/pause")
+async def pause_bot(_=Depends(verify_token)):
+    state.status = "PAUSED"
+    if state.loop_task:
+        state.loop_task.cancel()
+    await broadcast({"type": "status", "status": "PAUSED"})
+    tg.alert_bot_stop("Pausado manualmente")
+    return {"ok": True, "status": "PAUSED"}
+
+@app.post("/api/bot/resume")
+async def resume_bot(_=Depends(verify_token)):
+    state.status = "RUNNING"
+    state.loop_task = asyncio.create_task(bot_loop())
+    return {"ok": True, "status": "RUNNING"}
+
+@app.post("/api/bot/stop")
+async def stop_bot(_=Depends(verify_token)):
+    state.status = "STOPPED"
+    if state.loop_task:
+        state.loop_task.cancel()
+    await broadcast({"type": "status", "status": "STOPPED"})
+    tg.alert_bot_stop("Detenido manualmente")
+    return {"ok": True, "status": "STOPPED"}
+
+@app.post("/api/orders/close-all")
+async def close_all(_=Depends(verify_token)):
+    state.status = "STOPPED"
+    if state.loop_task:
+        state.loop_task.cancel()
+    result = oanda.close_all()
+    tg.alert_bot_stop("CIERRE DE EMERGENCIA — todas las posiciones cerradas")
+    await broadcast({"type": "close_all", "result": result})
+    return {"ok": True, "closed": result}
+
+class ManualOrder(BaseModel):
+    direction: str   # "LONG" o "SHORT"
+    units: float
+    sl_price: float
+    tp_price: float
+
+@app.post("/api/orders/manual")
+def manual_order(order: ManualOrder, _=Depends(verify_token)):
+    units = order.units if order.direction == "LONG" else -order.units
+    result = oanda.place_order(units, order.sl_price, order.tp_price, "Manual")
+    tg.alert_signal(order.direction, (order.sl_price+order.tp_price)/2,
+                    order.sl_price, order.tp_price, order.units, 0, "Orden manual")
+    return {"ok": True, "order": result}
+
+class RiskConfig(BaseModel):
+    risk_pct: Optional[float] = None
+    max_daily_loss_pct: Optional[float] = None
+
+@app.put("/api/config/risk")
+def update_risk(config: RiskConfig, _=Depends(verify_token)):
+    if config.risk_pct is not None:
+        cfg.risk_pct = config.risk_pct
+    if config.max_daily_loss_pct is not None:
+        cfg.max_daily_loss_pct = config.max_daily_loss_pct
+    return {"ok": True, "risk_pct": cfg.risk_pct, "max_daily_loss_pct": cfg.max_daily_loss_pct}
+
+# ── WEBSOCKET LIVE ────────────────────────────────────────────────
+@app.websocket("/ws/live")
+async def websocket_live(websocket: WebSocket):
+    await websocket.accept()
+    state.ws_clients.append(websocket)
+    log.info("ws.client_connected", total=len(state.ws_clients))
+    try:
+        # Enviar estado inicial
+        await websocket.send_json({
+            "type":   "init",
+            "status": state.status,
+            "price":  state.last_price,
+            "risk":   risk.get_status(),
+        })
+        while True:
+            # Mantener conexión viva esperando pings del cliente
+            data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+            if data == "ping":
+                await websocket.send_text("pong")
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    finally:
+        if websocket in state.ws_clients:
+            state.ws_clients.remove(websocket)
+        log.info("ws.client_disconnected", total=len(state.ws_clients))
